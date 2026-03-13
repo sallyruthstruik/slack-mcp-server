@@ -52,37 +52,43 @@ interface GetUserProfileArgs {
 
 export class SlackClient {
   private botHeaders: { Authorization: string; "Content-Type": string };
+  private teamId: string;
+  private channelIds: string[] | undefined;
 
-  constructor(botToken: string) {
+  constructor(botToken: string, teamId: string, channelIds?: string[]) {
     this.botHeaders = {
       Authorization: `Bearer ${botToken}`,
       "Content-Type": "application/json",
     };
+    this.teamId = teamId;
+    this.channelIds = channelIds;
   }
 
   async getChannels(limit: number = 100, cursor?: string): Promise<any> {
-    const predefinedChannelIds = process.env.SLACK_CHANNEL_IDS;
+    const predefinedChannelIds = this.channelIds?.length
+      ? this.channelIds
+      : undefined;
     if (!predefinedChannelIds) {
       const params = new URLSearchParams({
         types: "public_channel,private_channel",
         exclude_archived: "true",
         limit: Math.min(limit, 200).toString(),
-        team_id: process.env.SLACK_TEAM_ID!,
+        team_id: this.teamId,
       });
-  
+
       if (cursor) {
         params.append("cursor", cursor);
       }
-  
+
       const response = await fetch(
         `https://slack.com/api/conversations.list?${params}`,
         { headers: this.botHeaders },
       );
-  
+
       return response.json();
     }
 
-    const predefinedChannelIdsArray = predefinedChannelIds.split(",").map((id: string) => id.trim());
+    const predefinedChannelIdsArray = predefinedChannelIds;
     const channels = [];
 
     for (const channelId of predefinedChannelIdsArray) {
@@ -191,7 +197,7 @@ export class SlackClient {
   async getUsers(limit: number = 100, cursor?: string): Promise<any> {
     const params = new URLSearchParams({
       limit: Math.min(limit, 200).toString(),
-      team_id: process.env.SLACK_TEAM_ID!,
+      team_id: this.teamId,
     });
 
     if (cursor) {
@@ -383,16 +389,22 @@ async function runStdioServer(slackClient: SlackClient) {
   console.error("Slack MCP Server running on stdio");
 }
 
-async function runHttpServer(slackClient: SlackClient, port: number = 3000, authToken?: string) {
+/**
+ * Runs HTTP server in this process (no child process spawned).
+ * Keeps the process alive until SIGINT/SIGTERM; one process for all clients.
+ */
+async function runHttpServer(slackClient: SlackClient | null, port: number = 3000, authToken?: string) {
   console.error(`Starting Slack MCP Server with Streamable HTTP transport on port ${port}...`);
-  
+  if (!slackClient) {
+    console.error('SLACK_BOT_TOKEN and SLACK_TEAM_ID not set: MCP /mcp disabled; use /api (REST) with per-request credentials.');
+  }
+
   const app = express();
   app.use(express.json());
 
-  // Authorization middleware
+  // Authorization middleware (for MCP only)
   const authMiddleware = (req: express.Request, res: express.Response, next: express.NextFunction) => {
     if (!authToken) {
-      // No auth token configured, skip authorization
       return next();
     }
 
@@ -408,7 +420,7 @@ async function runHttpServer(slackClient: SlackClient, port: number = 3000, auth
       });
     }
 
-    const token = authHeader.substring(7); // Remove 'Bearer ' prefix
+    const token = authHeader.substring(7);
     if (token !== authToken) {
       return res.status(401).json({
         jsonrpc: '2.0',
@@ -423,88 +435,88 @@ async function runHttpServer(slackClient: SlackClient, port: number = 3000, auth
     next();
   };
 
-  // Map to store transports by session ID
   const transports: { [sessionId: string]: StreamableHTTPServerTransport } = {};
 
-  // Handle POST requests for client-to-server communication
-  app.post('/mcp', authMiddleware, async (req, res) => {
-    try {
-      // Check for existing session ID
+  if (slackClient) {
+    // Handle POST requests for client-to-server communication (MCP)
+    app.post('/mcp', authMiddleware, async (req, res) => {
+      try {
+        const sessionId = req.headers['mcp-session-id'] as string | undefined;
+        let transport: StreamableHTTPServerTransport;
+
+        if (sessionId && transports[sessionId]) {
+          transport = transports[sessionId];
+        } else if (!sessionId && req.body?.method === 'initialize') {
+          transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => randomUUID(),
+            onsessioninitialized: (sessionId) => {
+              transports[sessionId] = transport;
+            },
+          });
+
+          transport.onclose = () => {
+            if (transport.sessionId) {
+              delete transports[transport.sessionId];
+            }
+          };
+
+          const server = createSlackServer(slackClient!);
+          await server.connect(transport);
+        } else {
+          res.status(400).json({
+            jsonrpc: '2.0',
+            error: {
+              code: -32000,
+              message: 'Bad Request: No valid session ID provided',
+            },
+            id: null,
+          });
+          return;
+        }
+
+        await transport.handleRequest(req, res, req.body);
+      } catch (error) {
+        console.error('Error handling MCP request:', error);
+        if (!res.headersSent) {
+          res.status(500).json({
+            jsonrpc: '2.0',
+            error: {
+              code: -32603,
+              message: 'Internal server error',
+            },
+            id: null,
+          });
+        }
+      }
+    });
+
+    const handleSessionRequest = async (req: express.Request, res: express.Response) => {
       const sessionId = req.headers['mcp-session-id'] as string | undefined;
-      let transport: StreamableHTTPServerTransport;
-
-      if (sessionId && transports[sessionId]) {
-        // Reuse existing transport
-        transport = transports[sessionId];
-      } else if (!sessionId && req.body?.method === 'initialize') {
-        // New initialization request
-        transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          onsessioninitialized: (sessionId) => {
-            // Store the transport by session ID
-            transports[sessionId] = transport;
-          },
-        });
-
-        // Clean up transport when closed
-        transport.onclose = () => {
-          if (transport.sessionId) {
-            delete transports[transport.sessionId];
-          }
-        };
-
-        const server = createSlackServer(slackClient);
-        // Connect to the MCP server
-        await server.connect(transport);
-      } else {
-        // Invalid request
-        res.status(400).json({
-          jsonrpc: '2.0',
-          error: {
-            code: -32000,
-            message: 'Bad Request: No valid session ID provided',
-          },
-          id: null,
-        });
+      if (!sessionId || !transports[sessionId]) {
+        res.status(400).send('Invalid or missing session ID');
         return;
       }
+      const transport = transports[sessionId];
+      await transport.handleRequest(req, res);
+    };
 
-      // Handle the request
-      await transport.handleRequest(req, res, req.body);
-    } catch (error) {
-      console.error('Error handling MCP request:', error);
-      if (!res.headersSent) {
-        res.status(500).json({
-          jsonrpc: '2.0',
-          error: {
-            code: -32603,
-            message: 'Internal server error',
-          },
-          id: null,
-        });
-      }
-    }
-  });
+    app.get('/mcp', authMiddleware, handleSessionRequest);
+    app.delete('/mcp', authMiddleware, handleSessionRequest);
+  } else {
+    app.post('/mcp', (_, res) => {
+      res.status(503).json({
+        jsonrpc: '2.0',
+        error: {
+          code: -32000,
+          message: 'MCP disabled: set SLACK_BOT_TOKEN and SLACK_TEAM_ID for /mcp, or use REST /api with per-request credentials',
+        },
+        id: null,
+      });
+    });
+    app.get('/mcp', (_, res) => res.status(503).send('MCP disabled: set SLACK_BOT_TOKEN and SLACK_TEAM_ID'));
+    app.delete('/mcp', (_, res) => res.status(503).send('MCP disabled: set SLACK_BOT_TOKEN and SLACK_TEAM_ID'));
+  }
 
-  // Reusable handler for GET and DELETE requests
-  const handleSessionRequest = async (req: express.Request, res: express.Response) => {
-    const sessionId = req.headers['mcp-session-id'] as string | undefined;
-    if (!sessionId || !transports[sessionId]) {
-      res.status(400).send('Invalid or missing session ID');
-      return;
-    }
-    
-    const transport = transports[sessionId];
-    await transport.handleRequest(req, res);
-  };
-
-  // Handle GET requests for server-to-client notifications via Streamable HTTP
-  app.get('/mcp', authMiddleware, handleSessionRequest);
-
-  // Handle DELETE requests for session termination
-  app.delete('/mcp', authMiddleware, handleSessionRequest);
-
-  // Health endpoint - no authentication required
   app.get('/health', (req, res) => {
     res.status(200).json({
       status: 'healthy',
@@ -515,7 +527,7 @@ async function runHttpServer(slackClient: SlackClient, port: number = 3000, auth
   });
 
   const server = app.listen(port, '0.0.0.0', () => {
-    console.error(`Slack MCP Server running on http://0.0.0.0:${port}/mcp`);
+    console.error(`Slack MCP Server running on http://0.0.0.0:${port}${slackClient ? ' (MCP /mcp, /health)' : ' (/health, REST /api when implemented)'}`);
   });
 
   return server;
@@ -577,18 +589,27 @@ Examples:
 
 export async function main() {
   const { transport, port, authToken } = parseArgs();
-  
+
   const botToken = process.env.SLACK_BOT_TOKEN;
   const teamId = process.env.SLACK_TEAM_ID;
 
-  if (!botToken || !teamId) {
-    console.error(
-      "Please set SLACK_BOT_TOKEN and SLACK_TEAM_ID environment variables",
-    );
-    process.exit(1);
+  if (transport === 'stdio') {
+    if (!botToken || !teamId) {
+      console.error(
+        "Please set SLACK_BOT_TOKEN and SLACK_TEAM_ID environment variables",
+      );
+      process.exit(1);
+    }
   }
 
-  const slackClient = new SlackClient(botToken);
+  let slackClient: SlackClient | null = null;
+  if (botToken && teamId) {
+    const channelIds = process.env.SLACK_CHANNEL_IDS
+      ? process.env.SLACK_CHANNEL_IDS.split(",").map((s) => s.trim())
+      : undefined;
+    slackClient = new SlackClient(botToken, teamId, channelIds);
+  }
+
   let httpServer: any = null;
 
   // Setup graceful shutdown handlers
@@ -620,7 +641,7 @@ export async function main() {
   setupGracefulShutdown();
 
   if (transport === 'stdio') {
-    await runStdioServer(slackClient);
+    await runStdioServer(slackClient!);
   } else if (transport === 'http') {
     // Use auth token from command line, environment variable, or generate random
     let finalAuthToken = authToken || process.env.AUTH_TOKEN;
@@ -638,24 +659,24 @@ export async function main() {
   }
 }
 
-// Only run main() if this file is executed directly, not when imported by tests
-// This handles both direct execution and global npm installation
+// Only run main() if this file is executed directly, not when imported by tests.
+// One process, no spawn: server runs in this process and blocks until SIGINT/SIGTERM.
 if (import.meta.url.startsWith('file://')) {
-  const currentFile = fileURLToPath(import.meta.url);
+  const currentFile = resolve(fileURLToPath(import.meta.url));
   const executedFile = process.argv[1] ? resolve(process.argv[1]) : '';
-  
-  // Check if this is the main module being executed
-  // Don't run if we're in a test environment (jest)
-  const isTestEnvironment = process.argv.some(arg => arg.includes('jest')) || 
+
+  const isTestEnvironment = process.argv.some(arg => arg.includes('jest')) ||
                             process.env.NODE_ENV === 'test' ||
                             process.argv[1]?.includes('jest');
-  
+
+  const hasOurCliFlags = process.argv.includes('--transport') || process.argv.includes('--port');
   const isMainModule = !isTestEnvironment && (
-    currentFile === executedFile || 
+    currentFile === executedFile ||
     (process.argv[1] && process.argv[1].includes('slack-mcp')) ||
-    (process.argv[0].includes('node') && process.argv[1] && !process.argv[1].includes('test'))
+    (process.argv[0].includes('node') && process.argv[1] && !process.argv[1].includes('test')) ||
+    hasOurCliFlags
   );
-  
+
   if (isMainModule) {
     main().catch((error) => {
       console.error("Fatal error in main():", error);

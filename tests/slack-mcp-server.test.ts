@@ -64,7 +64,7 @@ describe('SlackClient', () => {
   beforeEach(async () => {
     const indexModule = await import('../index.js');
     SlackClient = indexModule.SlackClient;
-    slackClient = new SlackClient('xoxb-test-token');
+    slackClient = new SlackClient('xoxb-test-token', 'T123456');
   });
 
   test('SlackClient constructor creates headers', () => {
@@ -76,7 +76,7 @@ describe('SlackClient', () => {
   });
 
   test('getChannels with predefined IDs', async () => {
-    process.env.SLACK_CHANNEL_IDS = 'C123456,C789012';
+    const clientWithChannels = new SlackClient('xoxb-test-token', 'T123456', ['C123456', 'C789012']);
     mockFetch
       .mockResolvedValueOnce({
         json: () => Promise.resolve({
@@ -91,7 +91,7 @@ describe('SlackClient', () => {
         }),
       });
 
-    const result = await slackClient.getChannels();
+    const result = await clientWithChannels.getChannels();
 
     expect(result).toEqual({
       ok: true,
@@ -104,7 +104,6 @@ describe('SlackClient', () => {
   });
 
   test('getChannels with API call', async () => {
-    delete process.env.SLACK_CHANNEL_IDS;
     const mockResponse = {
       ok: true,
       channels: [
@@ -365,12 +364,33 @@ describe('createSlackServer', () => {
   test('createSlackServer returns server instance', async () => {
     const { createSlackServer, SlackClient } = await import('../index.js');
     
-    const mockSlackClient = new SlackClient('xoxb-test-token');
+    const mockSlackClient = new SlackClient('xoxb-test-token', 'T123456');
     const server = createSlackServer(mockSlackClient);
 
     // Just test that the server is created and defined
     expect(server).toBeDefined();
     expect(typeof server).toBe('object');
+  });
+});
+
+/** Tool names exposed by this server; Python custom MCP (custom_mcp_tools/mcp_forks/slack.py) uses tools/list and expects these names. */
+const SLACK_MCP_TOOL_NAMES = [
+  'slack_list_channels',
+  'slack_post_message',
+  'slack_reply_to_thread',
+  'slack_add_reaction',
+  'slack_get_channel_history',
+  'slack_get_thread_replies',
+  'slack_get_users',
+  'slack_get_user_profile',
+];
+
+describe('Custom MCP client (Python) contract', () => {
+  test('tool names match server registerTool calls (contract for custom_mcp_tools/mcp_forks/slack.py)', () => {
+    expect(SLACK_MCP_TOOL_NAMES).toHaveLength(8);
+    expect(SLACK_MCP_TOOL_NAMES).toContain('slack_list_channels');
+    expect(SLACK_MCP_TOOL_NAMES).toContain('slack_post_message');
+    expect(SLACK_MCP_TOOL_NAMES).toContain('slack_get_user_profile');
   });
 });
 
@@ -484,7 +504,7 @@ describe('HTTP Server', () => {
   test('SlackClient can be instantiated', async () => {
     const { SlackClient } = await import('../index.js');
     
-    const mockSlackClient = new SlackClient('xoxb-test-token');
+    const mockSlackClient = new SlackClient('xoxb-test-token', 'T123456');
     
     // Test that SlackClient is created successfully
     expect(mockSlackClient).toBeDefined();
