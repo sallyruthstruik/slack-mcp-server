@@ -1,8 +1,5 @@
 #!/usr/bin/env node
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { z } from "zod";
+import { z, type ZodTypeAny } from "zod";
 import express from "express";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from 'node:url';
@@ -226,13 +223,107 @@ export class SlackClient {
   }
 }
 
-export function createSlackServer(slackClient: SlackClient): McpServer {
-  const server = new McpServer({
-    name: "Slack MCP Server",
-    version: "1.0.0",
-  });
+// ---------------------------------------------------------------------------
+// RestToolServer — drop-in replacement for McpServer.
+// Same registerTool() interface; exposes listTools() / callTool() for REST.
+// ---------------------------------------------------------------------------
 
-  // Register all Slack tools using the modern API
+interface ToolEntry {
+  name: string;
+  title: string;
+  description: string;
+  inputSchema: Record<string, ZodTypeAny>;
+  handler: (args: any) => Promise<{ content: { type: string; text: string }[] }>;
+}
+
+export class RestToolServer {
+  private tools = new Map<string, ToolEntry>();
+
+  registerTool(
+    name: string,
+    config: { title?: string; description: string; inputSchema: Record<string, ZodTypeAny> },
+    handler: (args: any) => Promise<{ content: { type: string; text: string }[] }>,
+  ) {
+    this.tools.set(name, {
+      name,
+      title: config.title ?? name,
+      description: config.description,
+      inputSchema: config.inputSchema,
+      handler,
+    });
+  }
+
+  listTools() {
+    return Array.from(this.tools.values()).map(({ handler, inputSchema, ...meta }) => ({
+      ...meta,
+      inputSchema: zodShapeToJsonSchema(inputSchema),
+    }));
+  }
+
+  hasTool(name: string): boolean {
+    return this.tools.has(name);
+  }
+
+  async callTool(name: string, args: Record<string, any> = {}): Promise<any> {
+    const tool = this.tools.get(name)!;
+    const schema = z.object(tool.inputSchema);
+    const parsed = schema.parse(args);
+    const result = await tool.handler(parsed);
+    return JSON.parse(result.content[0].text);
+  }
+}
+
+// -- zod shape → JSON Schema helpers --
+
+function zodShapeToJsonSchema(shape: Record<string, ZodTypeAny>) {
+  const properties: Record<string, any> = {};
+  const required: string[] = [];
+
+  for (const [key, zodType] of Object.entries(shape)) {
+    const { prop, isRequired } = zodTypeToJsonProp(zodType);
+    properties[key] = prop;
+    if (isRequired) required.push(key);
+  }
+
+  return { type: "object" as const, properties, ...(required.length ? { required } : {}) };
+}
+
+function zodTypeToJsonProp(zodType: ZodTypeAny): { prop: any; isRequired: boolean } {
+  const desc = zodType.description;
+  let inner = zodType as any;
+  let defaultValue: any;
+  let hasDefault = false;
+  let isOptional = false;
+
+  if (inner._def.typeName === 'ZodDefault') {
+    hasDefault = true;
+    defaultValue = inner._def.defaultValue();
+    inner = inner._def.innerType;
+  }
+  if (inner._def.typeName === 'ZodOptional') {
+    isOptional = true;
+    inner = inner._def.innerType;
+  }
+
+  let type = 'string';
+  if (inner._def.typeName === 'ZodNumber') type = 'number';
+  else if (inner._def.typeName === 'ZodBoolean') type = 'boolean';
+
+  const prop: any = { type };
+  if (desc) prop.description = desc;
+  if (hasDefault) prop.default = defaultValue;
+
+  return { prop, isRequired: !isOptional && !hasDefault };
+}
+
+// ---------------------------------------------------------------------------
+// createSlackServer — tool registrations are UNCHANGED from the MCP version.
+// Only the return type changed: McpServer → RestToolServer.
+// ---------------------------------------------------------------------------
+
+export function createSlackServer(slackClient: SlackClient): RestToolServer {
+  const server = new RestToolServer();
+
   server.registerTool(
     "slack_list_channels",
     {
@@ -381,202 +472,169 @@ export function createSlackServer(slackClient: SlackClient): McpServer {
   return server;
 }
 
-async function runStdioServer(slackClient: SlackClient) {
-  console.error("Starting Slack MCP Server with stdio transport...");
-  const server = createSlackServer(slackClient);
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("Slack MCP Server running on stdio");
+// ---------------------------------------------------------------------------
+// Session store
+// ---------------------------------------------------------------------------
+
+interface SessionData {
+  botToken: string;
+  teamId: string;
+  channelIds?: string[];
+  createdAt: number;
 }
 
-/**
- * Runs HTTP server in this process (no child process spawned).
- * Keeps the process alive until SIGINT/SIGTERM; one process for all clients.
- */
-async function runHttpServer(slackClient: SlackClient | null, port: number = 3000, authToken?: string) {
-  console.error(`Starting Slack MCP Server with Streamable HTTP transport on port ${port}...`);
-  if (!slackClient) {
-    console.error('SLACK_BOT_TOKEN and SLACK_TEAM_ID not set: MCP /mcp disabled; use /api (REST) with per-request credentials.');
+const sessions = new Map<string, SessionData>();
+
+function createSession(data: Omit<SessionData, "createdAt">): string {
+  const key = "sk_" + randomUUID();
+  sessions.set(key, { ...data, createdAt: Date.now() });
+  return key;
+}
+
+// ---------------------------------------------------------------------------
+// extractCredentials middleware — resolves SlackClient from session or headers
+// ---------------------------------------------------------------------------
+
+function extractCredentials(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction,
+) {
+  const sessionKey = req.headers["x-session-key"] as string | undefined;
+  if (sessionKey) {
+    const session = sessions.get(sessionKey);
+    if (!session) {
+      res.status(401).json({ error: { code: "INVALID_SESSION", message: "Session not found or expired" } });
+      return;
+    }
+    res.locals.slackClient = new SlackClient(session.botToken, session.teamId, session.channelIds);
+    return next();
   }
 
+  const authHeader = req.headers.authorization;
+  const teamId = req.headers["x-slack-team-id"] as string | undefined;
+
+  if (!authHeader?.startsWith("Bearer ") || !teamId) {
+    res.status(401).json({
+      error: { code: "UNAUTHORIZED", message: "Provide Authorization + X-Slack-Team-Id headers, or X-Session-Key" },
+    });
+    return;
+  }
+
+  res.locals.slackClient = new SlackClient(authHeader.substring(7), teamId);
+  next();
+}
+
+// ---------------------------------------------------------------------------
+// HTTP server — REST API only (/api/*, /health)
+// ---------------------------------------------------------------------------
+
+const toolMeta = createSlackServer(null as any);
+
+async function runHttpServer(port: number = 3000) {
   const app = express();
   app.use(express.json());
 
-  // Authorization middleware (for MCP only)
-  const authMiddleware = (req: express.Request, res: express.Response, next: express.NextFunction) => {
-    if (!authToken) {
-      return next();
+  // GET /api/tools — tool metadata (no auth)
+  app.get('/api/tools', (_req, res) => {
+    res.json({ tools: toolMeta.listTools() });
+  });
+
+  // POST /api/tools/call — execute a tool (auth required)
+  app.post('/api/tools/call', extractCredentials, async (req, res) => {
+    const { name, arguments: args } = req.body;
+
+    if (!name) {
+      res.status(400).json({ error: { code: "BAD_REQUEST", message: "Tool name required" } });
+      return;
+    }
+    if (!toolMeta.hasTool(name)) {
+      res.status(404).json({ error: { code: "TOOL_NOT_FOUND", message: `Unknown tool: ${name}` } });
+      return;
     }
 
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({
-        jsonrpc: '2.0',
-        error: {
-          code: -32000,
-          message: 'Unauthorized: Missing or invalid Authorization header',
-        },
-        id: null,
-      });
-    }
-
-    const token = authHeader.substring(7);
-    if (token !== authToken) {
-      return res.status(401).json({
-        jsonrpc: '2.0',
-        error: {
-          code: -32000,
-          message: 'Unauthorized: Invalid token',
-        },
-        id: null,
-      });
-    }
-
-    next();
-  };
-
-  const transports: { [sessionId: string]: StreamableHTTPServerTransport } = {};
-
-  if (slackClient) {
-    // Handle POST requests for client-to-server communication (MCP)
-    app.post('/mcp', authMiddleware, async (req, res) => {
-      try {
-        const sessionId = req.headers['mcp-session-id'] as string | undefined;
-        let transport: StreamableHTTPServerTransport;
-
-        if (sessionId && transports[sessionId]) {
-          transport = transports[sessionId];
-        } else if (!sessionId && req.body?.method === 'initialize') {
-          transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => randomUUID(),
-            onsessioninitialized: (sessionId) => {
-              transports[sessionId] = transport;
-            },
-          });
-
-          transport.onclose = () => {
-            if (transport.sessionId) {
-              delete transports[transport.sessionId];
-            }
-          };
-
-          const server = createSlackServer(slackClient!);
-          await server.connect(transport);
-        } else {
-          res.status(400).json({
-            jsonrpc: '2.0',
-            error: {
-              code: -32000,
-              message: 'Bad Request: No valid session ID provided',
-            },
-            id: null,
-          });
-          return;
-        }
-
-        await transport.handleRequest(req, res, req.body);
-      } catch (error) {
-        console.error('Error handling MCP request:', error);
-        if (!res.headersSent) {
-          res.status(500).json({
-            jsonrpc: '2.0',
-            error: {
-              code: -32603,
-              message: 'Internal server error',
-            },
-            id: null,
-          });
-        }
+    try {
+      const server = createSlackServer(res.locals.slackClient);
+      const result = await server.callTool(name, args ?? {});
+      res.json({ result });
+    } catch (err: any) {
+      if (err.name === 'ZodError') {
+        res.status(400).json({ error: { code: "VALIDATION_ERROR", message: err.message } });
+      } else {
+        res.status(500).json({ error: { code: "INTERNAL_ERROR", message: err.message } });
       }
+    }
+  });
+
+  // POST /api/sessions — create session
+  app.post('/api/sessions', (req, res) => {
+    const { slack_bot_token, slack_team_id, slack_channel_ids } = req.body;
+
+    if (!slack_bot_token || !slack_team_id) {
+      res.status(400).json({ error: { code: "BAD_REQUEST", message: "slack_bot_token and slack_team_id required" } });
+      return;
+    }
+
+    const key = createSession({
+      botToken: slack_bot_token,
+      teamId: slack_team_id,
+      channelIds: slack_channel_ids,
     });
+    res.status(201).json({ session_key: key });
+  });
 
-    const handleSessionRequest = async (req: express.Request, res: express.Response) => {
-      const sessionId = req.headers['mcp-session-id'] as string | undefined;
-      if (!sessionId || !transports[sessionId]) {
-        res.status(400).send('Invalid or missing session ID');
-        return;
-      }
-      const transport = transports[sessionId];
-      await transport.handleRequest(req, res);
-    };
+  // DELETE /api/sessions/:key — delete session
+  app.delete('/api/sessions/:key', (req, res) => {
+    sessions.delete(req.params.key);
+    res.status(204).end();
+  });
 
-    app.get('/mcp', authMiddleware, handleSessionRequest);
-    app.delete('/mcp', authMiddleware, handleSessionRequest);
-  } else {
-    app.post('/mcp', (_, res) => {
-      res.status(503).json({
-        jsonrpc: '2.0',
-        error: {
-          code: -32000,
-          message: 'MCP disabled: set SLACK_BOT_TOKEN and SLACK_TEAM_ID for /mcp, or use REST /api with per-request credentials',
-        },
-        id: null,
-      });
-    });
-    app.get('/mcp', (_, res) => res.status(503).send('MCP disabled: set SLACK_BOT_TOKEN and SLACK_TEAM_ID'));
-    app.delete('/mcp', (_, res) => res.status(503).send('MCP disabled: set SLACK_BOT_TOKEN and SLACK_TEAM_ID'));
-  }
-
-  app.get('/health', (req, res) => {
+  // GET /health
+  app.get('/health', (_req, res) => {
     res.status(200).json({
       status: 'healthy',
       timestamp: new Date().toISOString(),
-      service: 'Slack MCP Server',
+      service: 'Slack REST API Server',
       version: '1.0.0'
     });
   });
 
   const server = app.listen(port, '0.0.0.0', () => {
-    console.error(`Slack MCP Server running on http://0.0.0.0:${port}${slackClient ? ' (MCP /mcp, /health)' : ' (/health, REST /api when implemented)'}`);
+    console.error(`Slack REST API server running on http://0.0.0.0:${port}`);
   });
 
   return server;
 }
 
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
+
 export function parseArgs() {
   const args = process.argv.slice(2);
-  let transport = 'stdio'; // default
   let port = 3000;
-  let authToken: string | undefined;
 
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--transport' && i + 1 < args.length) {
-      transport = args[i + 1];
-      i++; // skip next argument
-    } else if (args[i] === '--port' && i + 1 < args.length) {
+    if (args[i] === '--port' && i + 1 < args.length) {
       port = parseInt(args[i + 1], 10);
-      i++; // skip next argument
-    } else if (args[i] === '--token' && i + 1 < args.length) {
-      authToken = args[i + 1];
-      i++; // skip next argument
+      i++;
     } else if (args[i] === '--help' || args[i] === '-h') {
       console.log(`
 Usage: node index.js [options]
 
 Options:
-  --transport <type>     Transport type: 'stdio' or 'http' (default: stdio)
-  --port <number>        Port for HTTP server when using Streamable HTTP transport (default: 3000)
-  --token <token>   Bearer token for HTTP authorization (optional, can also use AUTH_TOKEN env var)
+  --port <number>        Port for HTTP server (default: 3000)
   --help, -h             Show this help message
 
-Environment Variables:
-  AUTH_TOKEN             Bearer token for HTTP authorization (fallback if --token not provided)
-
-Examples:
-  node index.js                                    # Use stdio transport (default)
-  node index.js --transport stdio                  # Use stdio transport explicitly
-  node index.js --transport http                   # Use Streamable HTTP transport on port 3000
-  node index.js --transport http --port 8080       # Use Streamable HTTP transport on port 8080
-  node index.js --transport http --token mytoken   # Use Streamable HTTP transport with custom auth token
-  AUTH_TOKEN=mytoken node index.js --transport http   # Use Streamable HTTP transport with auth token from env var
+REST API endpoints:
+  GET    /api/tools             List available tools (no auth)
+  POST   /api/tools/call        Call a tool (auth required)
+  POST   /api/sessions          Create a session
+  DELETE /api/sessions/:key     Delete a session
+  GET    /health                Health check
 `);
       process.exit(0);
     }
-  }
-
-  if (transport !== 'stdio' && transport !== 'http') {
-    console.error('Error: --transport must be either "stdio" or "http"');
-    process.exit(1);
   }
 
   if (isNaN(port) || port < 1 || port > 65535) {
@@ -584,46 +642,24 @@ Examples:
     process.exit(1);
   }
 
-  return { transport, port, authToken };
+  return { port };
 }
 
 export async function main() {
-  const { transport, port, authToken } = parseArgs();
-
-  const botToken = process.env.SLACK_BOT_TOKEN;
-  const teamId = process.env.SLACK_TEAM_ID;
-
-  if (transport === 'stdio') {
-    if (!botToken || !teamId) {
-      console.error(
-        "Please set SLACK_BOT_TOKEN and SLACK_TEAM_ID environment variables",
-      );
-      process.exit(1);
-    }
-  }
-
-  let slackClient: SlackClient | null = null;
-  if (botToken && teamId) {
-    const channelIds = process.env.SLACK_CHANNEL_IDS
-      ? process.env.SLACK_CHANNEL_IDS.split(",").map((s) => s.trim())
-      : undefined;
-    slackClient = new SlackClient(botToken, teamId, channelIds);
-  }
+  const { port } = parseArgs();
 
   let httpServer: any = null;
 
-  // Setup graceful shutdown handlers
   const setupGracefulShutdown = () => {
     const shutdown = (signal: string) => {
       console.error(`\nReceived ${signal}. Shutting down gracefully...`);
-      
+
       if (httpServer) {
         httpServer.close(() => {
           console.error('HTTP server closed.');
           process.exit(0);
         });
-        
-        // Force close after 5 seconds
+
         setTimeout(() => {
           console.error('Forcing shutdown...');
           process.exit(1);
@@ -639,28 +675,9 @@ export async function main() {
   };
 
   setupGracefulShutdown();
-
-  if (transport === 'stdio') {
-    await runStdioServer(slackClient!);
-  } else if (transport === 'http') {
-    // Use auth token from command line, environment variable, or generate random
-    let finalAuthToken = authToken || process.env.AUTH_TOKEN;
-    if (!finalAuthToken) {
-      finalAuthToken = randomUUID();
-      console.error(`Generated auth token: ${finalAuthToken}`);
-      console.error('Use this token in the Authorization header: Bearer ' + finalAuthToken);
-    } else if (authToken) {
-      console.error('Using provided auth token for authorization');
-    } else {
-      console.error('Using auth token from AUTH_TOKEN environment variable');
-    }
-    
-    httpServer = await runHttpServer(slackClient, port, finalAuthToken);
-  }
+  httpServer = await runHttpServer(port);
 }
 
-// Only run main() if this file is executed directly, not when imported by tests.
-// One process, no spawn: server runs in this process and blocks until SIGINT/SIGTERM.
 if (import.meta.url.startsWith('file://')) {
   const currentFile = resolve(fileURLToPath(import.meta.url));
   const executedFile = process.argv[1] ? resolve(process.argv[1]) : '';
@@ -669,7 +686,7 @@ if (import.meta.url.startsWith('file://')) {
                             process.env.NODE_ENV === 'test' ||
                             process.argv[1]?.includes('jest');
 
-  const hasOurCliFlags = process.argv.includes('--transport') || process.argv.includes('--port');
+  const hasOurCliFlags = process.argv.includes('--port');
   const isMainModule = !isTestEnvironment && (
     currentFile === executedFile ||
     (process.argv[1] && process.argv[1].includes('slack-mcp')) ||
