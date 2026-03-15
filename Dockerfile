@@ -31,3 +31,7 @@ RUN npm install -g .
 
 # Use tini as PID 1 for proper signal handling
 ENTRYPOINT ["tini", "--", "slack-mcp"]
+
+# Default: REST API (HTTP transport) on port 3000
+# Override for stdio: docker run ... slack-mcp-server --transport stdio
+CMD ["--transport", "http", "--port", "3000"]
